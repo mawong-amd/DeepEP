@@ -742,7 +742,16 @@ combine(void* combined_x,
         // `syncwarp()`, which carries the only inter-lane edge in this construct;
         // replacing it would delete that edge while appearing to strengthen the code.
         syncwarp();
+#ifdef USE_ROCM
         __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+#else
+        // Deliberately nothing on the CUDA path. Everything else in this commit
+        // restores what stood here before 0e2b798, so the CUDA arm stays
+        // byte-identical to that. The lane-coverage gap this fence closes is
+        // formally present on CUDA too, but it cannot be built or tested here,
+        // and an untested fence on a path we do not exercise is worse than a
+        // documented gap.
+#endif
         if (lane_id == 0)
             atomic_add_release_global(atomic_clean_flag, num_experts);
     }
