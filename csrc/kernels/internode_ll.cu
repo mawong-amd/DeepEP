@@ -720,15 +720,22 @@ combine(void* combined_x,
         for (int i = lane_id ;i < num_next_clean_int; i += kWarpSize)
             next_clean[i] = 0;
 
-        // Notify before executing `int_p`
+        // Notify before executing `int_p`.
+        //
+        // The zeroing loop above runs on ALL 64 lanes, but only lane 0 publishes.
+        // A release performed by lane 0 orders lane 0's accesses; `syncwarp()` is
+        // `fence(RELEASE,"wavefront") + wave_barrier + fence(ACQUIRE,"wavefront")`
+        // (utils.cuh) -- wavefront scope, no atomic -- so in the memory model the
+        // other 63 lanes' stores were never ordered against the publish. It happened
+        // to work because the writeback+drain the release emits are wave-wide in the
+        // ISA. Add an agent-scope release fence, executed by every lane, so the
+        // ordering is stated rather than inherited from codegen.  ADDITIVE: keep
+        // `syncwarp()`, which carries the only inter-lane edge in this construct;
+        // replacing it would delete that edge while appearing to strengthen the code.
         syncwarp();
-        if (lane_id == 0){
-            if constexpr (kMultinode){
-                atomic_add_release_global(atomic_clean_flag, num_experts);
-            }else{
-                atomic_add_relaxed_global(atomic_clean_flag, num_experts);
-            }
-        }
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+        if (lane_id == 0)
+            atomic_add_release_global(atomic_clean_flag, num_experts);
     }
 
     // Issue IBGDA sends
@@ -812,7 +819,8 @@ combine(void* combined_x,
         asm volatile("bar.sync %0, %1;" :: "r"(warp_group_id + 1), "r"(kNumWarpsPerGroup * 32));
 #endif
         if (sub_warp_id == 0 and lane_id == 0) {
-            while (ld_volatile_global(atomic_clean_flag) == 0);
+            // Acquire, pairing with the release above.
+            while (ld_acquire_global(atomic_clean_flag) == 0);
 
             if (dst_rank != rank) {
 #ifdef USE_ROCM
