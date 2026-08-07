@@ -289,12 +289,50 @@ dispatch(void* packed_recv_x,  void* packed_recv_x_scales,
             #pragma unroll
             for (int i = lane_id;i < num_next_clean_int;i += kWarpSize)
                 next_clean[i] = 0;
-            if constexpr (kMultinode){
-                syncwarp();
-                #pragma unroll 4
-                for (int i = lane_id;i < num_experts;i += kWarpSize)
-                    atomic_add_relaxed_global(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG);
-            }
+            // This publish must happen on the single-node path too, and it
+            // must be a RELEASE.  Two independent requirements, one line.
+            //
+            // (1) COUNT.  Publishing FINISHED_SUM_TAG here is what makes the
+            //     `FINISHED_SUM_TAG * 2` wait below mean "payload sends issued
+            //     AND SM 0 has zeroed the next slot".  Gated off, a rank
+            //     releases its peers before it has zeroed `next_clean`.
+            //
+            // (2) WRITEBACK.  `next_clean` is buffers[idx ^ 1]'s signalling
+            //     region, which `LowLatencyLayout::clean_meta()` asserts is
+            //     simultaneously the dispatch count array and the combine
+            //     recv-flag array -- dispatch always cleans the buffer the
+            //     immediately following combine will use.  A peer released
+            //     early completes its combine and puts its flag into that
+            //     region.  If our zeroes are still sitting as dirty lines in
+            //     this XCD's L2, the later writeback lands on top of the
+            //     peer's flag and the combine recv spin never exits.  The
+            //     hazard is ERASURE OF A PEER'S WRITE, not a stale read: the
+            //     peer only writes, it never acquires from us, so no release
+            //     scope creates a synchronizes-with edge with its write
+            //     engine.  What the release buys is that our zeroes are
+            //     retired out of L2 before our own count put below authorizes
+            //     anyone to write there.
+            //
+            //     On gfx950 RELEASE/AGENT emits `buffer_wbl2 sc1` +
+            //     `s_waitcnt vmcnt(0)`; a relaxed atomic emits neither, and
+            //     `s_barrier` -- what `syncwarp()`/`__syncthreads()` compile
+            //     to -- does not touch vector memory.  The writeback is the
+            //     operative half: a drain-only variant (`s_waitcnt vmcnt(0)`
+            //     with a relaxed publish) was measured and still deadlocks.
+            //     AGENT (`sc1`) was measured sufficient; SYSTEM (`sc0 sc1`)
+            //     is neither better nor worse.
+            //
+            // LANE COVERAGE.  `num_next_clean_int == num_experts` (asserted in
+            // the launcher) and both loops stride `kWarpSize` from `lane_id`,
+            // so lane L both zeroes and publishes exactly indices L, L+64, ...
+            // A waiter on counter[e] therefore synchronizes with the lane that
+            // zeroed next_clean[e].  Keep the two strides and bounds identical.
+            // `syncwarp()` is wavefront scope -- a reconvergence barrier only;
+            // the per-lane release RMWs do all of the ordering.
+            syncwarp();
+            #pragma unroll 4
+            for (int i = lane_id;i < num_experts;i += kWarpSize)
+                atomic_add_release_global(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG);
         }
         // This SM should be responsible for some destination experts, read `topk_idx` for them
         int expert_count[kNumWarpGroups] = {0};
@@ -344,12 +382,20 @@ dispatch(void* packed_recv_x,  void* packed_recv_x_scales,
         const auto dst_expert_local_idx = responsible_expert_idx % num_local_experts;
         const auto num_tokens_sent = shared_num_tokens_sent_per_expert[responsible_expert_idx - sm_id * kNumWarpGroups];
 
-        // Wait local sends issued and send expert counts
-        if constexpr(kMultinode){
-            while (ld_volatile_global(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG * 2);
-        }else{
-            while (ld_volatile_global(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG);
-        }
+        // Wait for local sends issued AND SM 0's zeroing of the next slot,
+        // then send expert counts.  `* 2` holds on BOTH paths; per expert e,
+        // with S_e = number of (token, topk) entries routed to e:
+        //   +1 per payload send, summing to S_e   (guarded dst_expert_idx >= 0)
+        //   + (FINISHED_SUM_TAG - S_e)            exactly once, from the block
+        //                                         whose window contains e
+        //   + FINISHED_SUM_TAG                    exactly once, from SM 0
+        //   = 2 * FINISHED_SUM_TAG
+        // The counter starts at zero and is reset below by the same thread
+        // that waited.  None of the three contributors is kMultinode-gated.
+        // Acquire pairs with the release add above; the (TAG - S_e) add stays
+        // relaxed because its only antecedent is an LDS write already ordered
+        // by the intervening barrier.
+        while (ld_acquire_global(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG * 2);
         if (dst_rank != rank) {
 #ifdef USE_ROCM
             if constexpr (!kMultinode){
@@ -569,6 +615,12 @@ void dispatch(void* packed_recv_x,
     auto atomic_counter_per_expert = reinterpret_cast<int*>(workspace);
     auto atomic_finish_counter_per_expert = atomic_counter_per_expert + num_experts;
     EP_HOST_ASSERT(num_experts * sizeof(int) * 2 <= NUM_WORKSPACE_BYTES);
+    // SM 0's zeroing loop and its publish loop are both strided
+    // `lane_id += kWarpSize`, so lane L covers the same index set in both only
+    // if the bounds are equal.  Widening the signalling region without
+    // widening the publish would leave slots zeroed with no matching release
+    // -- a silent, load-dependent hang.
+    EP_HOST_ASSERT(num_next_clean_int == num_experts);
         // FP8 checks
     if (use_ue8m0)
         EP_HOST_ASSERT(round_scale and "UE8M0 SF requires `round_scale=True`");
