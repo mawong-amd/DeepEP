@@ -493,17 +493,26 @@ dispatch(void* packed_recv_x,  void* packed_recv_x_scales,
         EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Requires more than one warp per group");
         if (sub_warp_id == 0 and lane_id == 0) {
             auto start_time = clock64();
-            if constexpr (kMultinode){
-                while ((num_recv_tokens = ld_relaxed_sys_global(reinterpret_cast<int64_t*>(rdma_recv_count + local_expert_idx * num_ranks + src_rank))) == 0){
-                    if ((clock64() - start_time) >= NUM_TIMEOUT_CYCLES){
-                        printf("dispatch recieve time out \\n");
-                    }
-                }
-            }else{
-                while ((num_recv_tokens = ld_volatile_global(reinterpret_cast<int64_t*>(rdma_recv_count + local_expert_idx * num_ranks + src_rank))) == 0){
-                    if ((clock64() - start_time) >= NUM_TIMEOUT_CYCLES){
-                        printf("dispatch recieve single node time out \\n");
-                    }
+            // Acquire, not relaxed.  The publisher of this count is a PEER rank,
+            // and the payload it gates is read below with `ld_nc_global`
+            // (`__builtin_nontemporal_load`), which carries no ordering and no
+            // cache invalidate of its own.  A relaxed load can therefore be
+            // satisfied from a stale line and the expert consumes stale tokens --
+            // a silent wrong-answer hazard, not a hang.  The acquire emits the
+            // `buffer_inv` the subsequent payload reads depend on, and the
+            // `__syncthreads()` below propagates it to the rest of the block,
+            // which shares this CU.
+            //
+            // SYSTEM scope here, unlike the combine clean-flag pairing: that flag
+            // is device-local workspace, this one is written by another agent.
+            // Use `ld_acquire_sys_global`, NOT `ld_acquire_global`: the latter's
+            // int64_t overload is declared `int` and truncates (utils.cuh:255).
+            //
+            // The kMultinode split was vacuous: `ld_relaxed_sys_global` and
+            // `ld_volatile_global` are both `__hip_atomic_load(RELAXED, SYSTEM)`.
+            while ((num_recv_tokens = ld_acquire_sys_global(reinterpret_cast<int64_t*>(rdma_recv_count + local_expert_idx * num_ranks + src_rank))) == 0){
+                if ((clock64() - start_time) >= NUM_TIMEOUT_CYCLES){
+                    printf("dispatch recieve time out \\n");
                 }
             }
             num_recv_tokens = -num_recv_tokens - 1;
