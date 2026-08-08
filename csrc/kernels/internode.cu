@@ -915,7 +915,8 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 }
 #ifdef ENABLE_TIMER
                 // Timeout check
-                long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
+                auto now = wall_clock64();  // once: s_memrealtime is long-latency
+                    long long int elapsed_time = now > start_time ? now - start_time : 0;
                 if (elapsed_time > NUM_TIMEOUT_CYCLES) {
                     printf("DeepEP dispatch forwarder timeout (RDMA meta), channel: %d, RDMA: %d, nvl: %d, src RDMA lane: %d, dst NVL: %d, meta: %d, %d, %d, %d\n",
                            channel_id, rdma_rank, nvl_rank, lane_id, dst_nvl_rank, meta_0, meta_1, meta_2, meta_3);
@@ -948,7 +949,8 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 cached_nvl_channel_head = ld_volatile_global(nvl_channel_head.buffer());
 #ifdef ENABLE_TIMER
                 // Timeout check
-                long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
+                auto now = wall_clock64();  // once: s_memrealtime is long-latency
+                    long long int elapsed_time = now > start_time ? now - start_time : 0;
                 if (elapsed_time > NUM_TIMEOUT_CYCLES) {
                     printf("DeepEP dispatch forwarder timeout (NVL check), channel: %d, RDMA: %d, nvl: %d, dst NVL: %d, head: %d, tail: %d\n",
                            channel_id, rdma_rank, nvl_rank, dst_nvl_rank, ld_volatile_global(nvl_channel_head.buffer()), cached_nvl_channel_tail);
@@ -972,7 +974,8 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 }
 #ifdef ENABLE_TIMER
                 // Timeout check
-                long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
+                auto now = wall_clock64();  // once: s_memrealtime is long-latency
+                    long long int elapsed_time = now > start_time ? now - start_time : 0;
                 if (elapsed_time > NUM_TIMEOUT_CYCLES and lane_id < kNumRDMARanks) {
                     printf("DeepEP dispatch forwarder timeout (RDMA check), channel: %d, RDMA: %d, nvl: %d, dst NVL: %d, src RDMA lane: %d, head: %d, tail: %d, expected: %d\n",
                            channel_id, rdma_rank, nvl_rank, dst_nvl_rank, lane_id, cached_rdma_channel_head, cached_rdma_channel_tail, num_tokens_to_recv_from_rdma);
@@ -1137,7 +1140,8 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
 
 #ifdef ENABLE_TIMER
             // Timeout check
-            long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
+            auto now = wall_clock64();  // once: s_memrealtime is long-latency
+                    long long int elapsed_time = now > start_time ? now - start_time : 0;
             if (elapsed_time > NUM_TIMEOUT_CYCLES) {
                 printf("DeepEP dispatch NVL receiver timeout, channel: %d, RDMA: %d, nvl: %d, src RDMA: %d, src nvl: %d, start: %d, end: %d\n",
                        channel_id, rdma_rank, nvl_rank, lane_id, src_nvl_rank, start_offset, end_offset);
@@ -1166,7 +1170,8 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
 
                 // Timeout check
 #ifdef ENABLE_TIMER
-                long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
+                auto now = wall_clock64();  // once: s_memrealtime is long-latency
+                    long long int elapsed_time = now > start_time ? now - start_time : 0;
                 if (elapsed_time > NUM_TIMEOUT_CYCLES) {
                     printf("DeepEP dispatch NVL receiver timeout, channel: %d, RDMA: %d, nvl: %d, src NVL: %d, head: %d, tail: %d\n",
                            channel_id, rdma_rank, nvl_rank, src_nvl_rank, cached_channel_head_idx, cached_channel_tail_idx);

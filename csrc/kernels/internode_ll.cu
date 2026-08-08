@@ -906,7 +906,13 @@ combine(void* combined_x,
             // vacuous. The producer is a peer agent and the payload below is
             // read with `ld_nc_global`, which carries no invalidate. Mirrors
             // the dispatch-side fix in c9b2dd1.
-            while (ld_acquire_sys_global(reinterpret_cast<int64_t*>(rdma_recv_flag + responsible_expert_idx)) == 0);
+            while (ld_relaxed_sys_global(reinterpret_cast<int64_t*>(rdma_recv_flag + responsible_expert_idx)) == 0) {
+#ifdef USE_ROCM
+                __builtin_amdgcn_s_sleep(1);
+#endif
+            }
+            // One fence on exit rather than an invalidate per iteration.
+            acquire_fence_sys();
         }
     }
     grid_barrier(global_atomic_counter, num_sms);

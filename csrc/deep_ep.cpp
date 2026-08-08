@@ -99,6 +99,11 @@ Buffer::Buffer(int rank,
     if (num_nvl_bytes > 0) {
         // Local IPC: alloc local memory and set local IPC handles
 #ifdef USE_ROCM
+        // Uncached. Measured against hipDeviceMallocDefault on gfx950
+        // (DSV2-Lite DP=2/EP + HT + DBO, fixed work): 871.6 vs 871.5 tok/s,
+        // i.e. no difference. The staging buffer is streamed -- each token is
+        // written once by a peer and read once locally -- so there is no reuse
+        // for L2 to exploit, and giving it up costs nothing.
     	CUDA_CHECK(hipExtMallocWithFlags(&buffer_ptrs[nvl_rank], num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes + barrier_signal_ptr_bytes, hipDeviceMallocUncached));
 #else
         CUDA_CHECK(cudaMalloc(&buffer_ptrs[nvl_rank], num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes + barrier_signal_ptr_bytes));
