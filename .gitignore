@@ -6,3 +6,13 @@ build/
 .cache/
 .vscode/
 */cmake-build-*/
+
+# hipify output and build products. `setup.py --variant rocm` writes a *_hip.*
+# / *.hip twin next to every source file, plus the extension in-tree. A
+# `git add -A` after a build otherwise sweeps ~9k lines of generated code and a
+# 15MB .so into the commit.
+*_hip.cpp
+*_hip.hpp
+*_hip.cuh
+*.hip
+deep_ep_cpp.cpython-*.so

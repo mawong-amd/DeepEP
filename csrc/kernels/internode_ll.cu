@@ -40,6 +40,11 @@ __device__ void grid_barrier(int* global_counter, int num_blocks) {
         }
     }
     __syncthreads();
+    // Wait side. Arrival has `__threadfence()`; without a matching acquire
+    // here, a block that observed the barrier has no ordering against payload
+    // other blocks published before arriving -- and every block goes on to
+    // read experts it did not itself wait on.
+    __threadfence_system();
 }
 
 
@@ -399,6 +404,9 @@ dispatch(void* packed_recv_x,  void* packed_recv_x_scales,
         if (dst_rank != rank) {
 #ifdef USE_ROCM
             if constexpr (!kMultinode){
+                // The kMultinode sibling below fences; this arm did not, with
+                // no stated reason. EP<=8 always takes this one.
+                __threadfence_system();
                 rocshmem::rocshmem_long_p(rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank);
             }else{
                 __threadfence_system();
@@ -843,6 +851,8 @@ combine(void* combined_x,
             if (dst_rank != rank) {
 #ifdef USE_ROCM
                 if constexpr (!kMultinode){
+                    // As above: the kMultinode sibling fences, this one did not.
+                    __threadfence_system();
                     rocshmem::rocshmem_long_p(rdma_recv_flag + global_expert_idx, 1, dst_rank);
                 } else {
                     __threadfence_system();
@@ -891,11 +901,12 @@ combine(void* combined_x,
     if (responsible_expert_idx < num_experts) {
         // EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Invalid number of warps per group");
         if (sub_warp_id == 0 and lane_id == 0){
-            if constexpr (kMultinode){
-                while (ld_relaxed_sys_global(reinterpret_cast<int64_t*>(rdma_recv_flag + responsible_expert_idx)) == 0);
-            }else{
-                while (ld_volatile_global(reinterpret_cast<int64_t*>(rdma_recv_flag + responsible_expert_idx)) == 0);
-            }
+            // Both arms were relaxed: on ROCm `ld_volatile_global` is
+            // __hip_atomic_load(RELAXED, SYSTEM) (utils.cuh), so the split was
+            // vacuous. The producer is a peer agent and the payload below is
+            // read with `ld_nc_global`, which carries no invalidate. Mirrors
+            // the dispatch-side fix in c9b2dd1.
+            while (ld_acquire_sys_global(reinterpret_cast<int64_t*>(rdma_recv_flag + responsible_expert_idx)) == 0);
         }
     }
     grid_barrier(global_atomic_counter, num_sms);

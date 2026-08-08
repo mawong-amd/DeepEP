@@ -718,7 +718,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             if (is_token_in_rank_uint64 != 0) {
                 rdma_tail_idx = rdma_send_channel_next_tail[lane_id] ++;
                 while (rdma_tail_idx - cached_rdma_channel_head >= num_max_rdma_chunked_recv_tokens)
-                    cached_rdma_channel_head = static_cast<int>(ld_volatile_global(rdma_channel_head.buffer(lane_id)));
+                    cached_rdma_channel_head = static_cast<int>(ld_acquire_sys_global(rdma_channel_head.buffer(lane_id)));
             }
             syncwarp();
 
@@ -1056,7 +1056,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             // Move tail index
             syncwarp();
             if (lane_id == 0)
-                st_relaxed_sys_global(nvl_channel_tail.buffer(), cached_nvl_channel_tail);
+                st_release_sys_global(nvl_channel_tail.buffer(), cached_nvl_channel_tail);
         }
 
         // Retired
@@ -1162,7 +1162,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 // Ready to copy
                 if (cached_channel_head_idx != cached_channel_tail_idx)
                     break;
-                cached_channel_tail_idx = ld_relaxed_sys_global(nvl_channel_tail.buffer());
+                cached_channel_tail_idx = ld_acquire_sys_global(nvl_channel_tail.buffer());
 
                 // Timeout check
 #ifdef ENABLE_TIMER
@@ -1753,7 +1753,7 @@ combine(int4* combined_x, float* combined_topk_weights,
             // Move queue tail
             syncwarp();
             if (lane_id < kNumRDMARanks and is_lane_ready)
-                st_relaxed_sys_global(nvl_channel_tail.buffer() + lane_id,
+                st_release_sys_global(nvl_channel_tail.buffer() + lane_id,
                                     cached_channel_tail_idx);
         }
     } else {
@@ -1815,12 +1815,21 @@ combine(int4* combined_x, float* combined_topk_weights,
             };
 #endif
             auto send_buffer = dst_rdma_rank == rdma_rank ? rdma_channel_data.recv_buffer(dst_rdma_rank) : rdma_channel_data.send_buffer(dst_rdma_rank);
-            auto sync_large_warp = [=]() {
+            auto sync_large_warp = [&]() {
                 if (kNumWarpsPerForwarder == 1) {
                     syncwarp();
                 } else {
 #ifdef USE_ROCM
-                    __syncthreads();
+                    // Was `__syncthreads()`: a block-wide rendezvous standing
+                    // in for a per-`dst_rdma_rank` named barrier. Forwarder
+                    // groups have different token counts, so that is divergent
+                    // -- and a group stalled in it cannot run
+                    // `forwarder_coordinator()` to push its `nvl_channel_head`
+                    // back to its peer, closing a cross-node cycle. The
+                    // per-rank barrier array was already declared and
+                    // initialised above for exactly this, and never used.
+                    wait_workgroup_warp_barrier(&combine_large_warp_barriers[dst_rdma_rank],
+                                                kNumWarpsPerForwarder, lane_id == 0);
 #else
                     asm volatile("bar.sync %0, %1;" ::"r"(dst_rdma_rank + 2), "r"(kNumWarpsPerForwarder * kWarpSize));
 #endif
@@ -1877,7 +1886,7 @@ combine(int4* combined_x, float* combined_topk_weights,
 #endif
                     // Wait lanes to be ready
                     while (cached_nvl_channel_tail_idx <= expected_head)
-                        cached_nvl_channel_tail_idx = ld_relaxed_sys_global(nvl_channel_tail.buffer(lane_id));
+                        cached_nvl_channel_tail_idx = ld_acquire_sys_global(nvl_channel_tail.buffer(lane_id));
 
                     // Combine current token
                     auto rdma_slot_idx = token_idx % num_max_rdma_chunked_recv_tokens;
@@ -2003,7 +2012,7 @@ combine(int4* combined_x, float* combined_topk_weights,
 
                 // Wait lanes to be ready
                 while (cached_channel_tail_idx <= expected_head)
-                    cached_channel_tail_idx = static_cast<int>(ld_relaxed_sys_global(rdma_channel_tail.buffer(lane_id)));
+                    cached_channel_tail_idx = static_cast<int>(ld_acquire_sys_global(rdma_channel_tail.buffer(lane_id)));
 
                 syncwarp();
 

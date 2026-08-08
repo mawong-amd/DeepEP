@@ -118,6 +118,19 @@ __device__ __forceinline__ void trap() {
     asm("trap;");
 #endif
 }
+// Acquire-only fence. Pairs with a *relaxed atomic* load of the same location
+// earlier in this thread to give exactly the happens-before of an acquire load
+// ([atomics.fences]/3), without emitting `buffer_inv` on every spin iteration.
+// Deliberately not `memory_fence()`: that is acq_rel and would add a
+// `buffer_wbl2 sc0 sc1` writeback the consumer side does not need.
+__device__ __forceinline__ void acquire_fence_sys() {
+#ifdef USE_ROCM
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");  // "" == system scope
+#else
+    asm volatile("fence.acquire.sys;" ::: "memory");
+#endif
+}
+
 // __device__ __forceinline__ void memory_fence() {
 //    asm volatile("fence.acq_rel.sys;":: : "memory");
 // }

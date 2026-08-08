@@ -345,11 +345,32 @@ Buffer::get_dispatch_layout(
         at::cuda::setCurrentCUDAStream(comm_stream);
     }
 
-    // Wait previous tasks to be finished
+    // Wait previous tasks to be finished.
+    //
+    // The wait on `compute_stream` is unconditional, and must be: the output
+    // tensors below are allocated with `compute_stream` current, so the caching
+    // allocator may hand us a block whose previous owner still has work in
+    // flight on that stream. The allocator's safety argument is that a stream
+    // is in-order, but we are about to write those blocks from `comm_stream`,
+    // which is a third stream it knows nothing about. Taking only the
+    // `previous_event` branch leaves that unordered -- and callers pass a
+    // `previous_event` exactly when they are overlapping streams and so are
+    // most exposed (vLLM's dual-batch overlap does).
+    //
+    // `previous_event` is an additional, narrower dependency, not a substitute.
+    //
+    // Scope, precisely: this closes the ALLOC-side hazard only, and only when
+    // the outputs are allocated on the caller's stream. When
+    // `allocate_on_comm_stream` is set they are allocated on `comm_stream`
+    // itself (see the `setCurrentCUDAStream` above), so the wait buys nothing
+    // and `stream_wait` would trip its own `s_0.id() != s_1.id()` assert.
+    // The symmetric FREE-side hazard on the *input* tensors -- allocated by the
+    // caller on a stream this function never waits on or records against -- is
+    // NOT addressed here.
+    if (not allocate_on_comm_stream and comm_stream.id() != compute_stream.id())
+        stream_wait(comm_stream, compute_stream);
     if (previous_event.has_value()) {
         stream_wait(comm_stream, previous_event.value());
-    } else {
-        stream_wait(comm_stream, compute_stream);
     }
 
     auto num_tokens = static_cast<int>(topk_idx.size(0)), num_topk = static_cast<int>(topk_idx.size(1));
@@ -373,8 +394,14 @@ Buffer::get_dispatch_layout(
 
     // Wait streams
     std::optional<EventHandle> event;
-    if (async) {
-        event = EventHandle(comm_stream);
+    // Tell the caching allocator every tensor here is live on
+    // `comm_stream`, on BOTH paths. The sync path's
+    // `stream_wait(compute_stream, comm_stream)` below orders the
+    // caller's stream after us, but says nothing about the streams
+    // the *input* tensors were allocated on -- under an overlapped
+    // caller (vLLM's dual-batch overlap) that is a third stream,
+    // and the allocator will happily recycle those blocks while we
+    // are still reading them.
         for (auto& t : {topk_idx, num_tokens_per_rank, num_tokens_per_expert, is_token_in_rank}) {
             t.record_stream(comm_stream);
             if (allocate_on_comm_stream)
@@ -385,6 +412,8 @@ Buffer::get_dispatch_layout(
             if (allocate_on_comm_stream)
                 to.has_value() ? to->record_stream(compute_stream) : void();
         }
+    if (async) {
+        event = EventHandle(comm_stream);
     } else {
         stream_wait(compute_stream, comm_stream);
     }
@@ -487,9 +516,25 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
     float* x_scales_ptr = nullptr;
     int num_scales = 0, scale_token_stride = 0, scale_hidden_stride = 0;
     if (x_scales.has_value()) {
+        // `scale_token_stride`/`scale_hidden_stride` are computed just below
+        // and handed to the kernels, but the kernels index `x_scales` as
+        // `token_idx * num_scales + i` and ignore them (intranode.cu,
+        // internode.cu). Until they honour the strides, refuse any layout the
+        // indexing does not match, rather than silently reading the wrong
+        // scales and returning plausible numbers. Every other tensor here is
+        // already checked; this one was not.
+
         EP_HOST_ASSERT(x.element_size() == 1);
         EP_HOST_ASSERT(x_scales->scalar_type() == torch::kFloat32 or x_scales->scalar_type() == torch::kInt);
         EP_HOST_ASSERT(x_scales->dim() == 2);
+        // `scale_token_stride`/`scale_hidden_stride` are computed below and
+        // handed to the kernels, but the kernels index `x_scales` as
+        // `token_idx * num_scales + i` and ignore them (intranode.cu:486,
+        // internode.cu). Until they honour the strides, refuse any layout the
+        // indexing does not match rather than silently reading the wrong
+        // scales and returning plausible numbers. Every other tensor here is
+        // already checked; this one was not.
+        EP_HOST_ASSERT(x_scales->is_contiguous());
         EP_HOST_ASSERT(x_scales->size(0) == num_tokens);
         num_scales = x_scales->dim() == 1 ? 1 : static_cast<int>(x_scales->size(1));
         x_scales_ptr = static_cast<float*>(x_scales->data_ptr());
@@ -505,11 +550,32 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
         at::cuda::setCurrentCUDAStream(comm_stream);
     }
 
-    // Wait previous tasks to be finished
+    // Wait previous tasks to be finished.
+    //
+    // The wait on `compute_stream` is unconditional, and must be: the output
+    // tensors below are allocated with `compute_stream` current, so the caching
+    // allocator may hand us a block whose previous owner still has work in
+    // flight on that stream. The allocator's safety argument is that a stream
+    // is in-order, but we are about to write those blocks from `comm_stream`,
+    // which is a third stream it knows nothing about. Taking only the
+    // `previous_event` branch leaves that unordered -- and callers pass a
+    // `previous_event` exactly when they are overlapping streams and so are
+    // most exposed (vLLM's dual-batch overlap does).
+    //
+    // `previous_event` is an additional, narrower dependency, not a substitute.
+    //
+    // Scope, precisely: this closes the ALLOC-side hazard only, and only when
+    // the outputs are allocated on the caller's stream. When
+    // `allocate_on_comm_stream` is set they are allocated on `comm_stream`
+    // itself (see the `setCurrentCUDAStream` above), so the wait buys nothing
+    // and `stream_wait` would trip its own `s_0.id() != s_1.id()` assert.
+    // The symmetric FREE-side hazard on the *input* tensors -- allocated by the
+    // caller on a stream this function never waits on or records against -- is
+    // NOT addressed here.
+    if (not allocate_on_comm_stream and comm_stream.id() != compute_stream.id())
+        stream_wait(comm_stream, compute_stream);
     if (previous_event.has_value()) {
         stream_wait(comm_stream, previous_event.value());
-    } else {
-        stream_wait(comm_stream, compute_stream);
     }
 
     // Create handles (only return for non-cached mode)
@@ -667,8 +733,14 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
 
     // Wait streams
     std::optional<EventHandle> event;
-    if (async) {
-        event = EventHandle(comm_stream);
+    // Tell the caching allocator every tensor here is live on
+    // `comm_stream`, on BOTH paths. The sync path's
+    // `stream_wait(compute_stream, comm_stream)` below orders the
+    // caller's stream after us, but says nothing about the streams
+    // the *input* tensors were allocated on -- under an overlapped
+    // caller (vLLM's dual-batch overlap) that is a third stream,
+    // and the allocator will happily recycle those blocks while we
+    // are still reading them.
         for (auto& t : {x,
                         is_token_in_rank,
                         rank_prefix_matrix,
@@ -695,6 +767,8 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
             if (allocate_on_comm_stream)
                 to.has_value() ? to->record_stream(compute_stream) : void();
         }
+    if (async) {
+        event = EventHandle(comm_stream);
     } else {
         stream_wait(compute_stream, comm_stream);
     }
@@ -758,11 +832,32 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
         at::cuda::setCurrentCUDAStream(comm_stream);
     }
 
-    // Wait previous tasks to be finished
+    // Wait previous tasks to be finished.
+    //
+    // The wait on `compute_stream` is unconditional, and must be: the output
+    // tensors below are allocated with `compute_stream` current, so the caching
+    // allocator may hand us a block whose previous owner still has work in
+    // flight on that stream. The allocator's safety argument is that a stream
+    // is in-order, but we are about to write those blocks from `comm_stream`,
+    // which is a third stream it knows nothing about. Taking only the
+    // `previous_event` branch leaves that unordered -- and callers pass a
+    // `previous_event` exactly when they are overlapping streams and so are
+    // most exposed (vLLM's dual-batch overlap does).
+    //
+    // `previous_event` is an additional, narrower dependency, not a substitute.
+    //
+    // Scope, precisely: this closes the ALLOC-side hazard only, and only when
+    // the outputs are allocated on the caller's stream. When
+    // `allocate_on_comm_stream` is set they are allocated on `comm_stream`
+    // itself (see the `setCurrentCUDAStream` above), so the wait buys nothing
+    // and `stream_wait` would trip its own `s_0.id() != s_1.id()` assert.
+    // The symmetric FREE-side hazard on the *input* tensors -- allocated by the
+    // caller on a stream this function never waits on or records against -- is
+    // NOT addressed here.
+    if (not allocate_on_comm_stream and comm_stream.id() != compute_stream.id())
+        stream_wait(comm_stream, compute_stream);
     if (previous_event.has_value()) {
         stream_wait(comm_stream, previous_event.value());
-    } else {
-        stream_wait(comm_stream, compute_stream);
     }
 
     int num_topk = 0;
@@ -839,8 +934,14 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
 
     // Wait streams
     std::optional<EventHandle> event;
-    if (async) {
-        event = EventHandle(comm_stream);
+    // Tell the caching allocator every tensor here is live on
+    // `comm_stream`, on BOTH paths. The sync path's
+    // `stream_wait(compute_stream, comm_stream)` below orders the
+    // caller's stream after us, but says nothing about the streams
+    // the *input* tensors were allocated on -- under an overlapped
+    // caller (vLLM's dual-batch overlap) that is a third stream,
+    // and the allocator will happily recycle those blocks while we
+    // are still reading them.
         for (auto& t : {x, src_idx, send_head, rank_prefix_matrix, channel_prefix_matrix, recv_x}) {
             t.record_stream(comm_stream);
             if (allocate_on_comm_stream)
@@ -851,6 +952,8 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
             if (allocate_on_comm_stream)
                 to.has_value() ? to->record_stream(compute_stream) : void();
         }
+    if (async) {
+        event = EventHandle(comm_stream);
     } else {
         stream_wait(compute_stream, comm_stream);
     }
@@ -983,9 +1086,25 @@ Buffer::internode_dispatch(const torch::Tensor& x,
     float* x_scales_ptr = nullptr;
     int num_scales = 0, scale_token_stride = 0, scale_hidden_stride = 0;
     if (x_scales.has_value()) {
+        // `scale_token_stride`/`scale_hidden_stride` are computed just below
+        // and handed to the kernels, but the kernels index `x_scales` as
+        // `token_idx * num_scales + i` and ignore them (intranode.cu,
+        // internode.cu). Until they honour the strides, refuse any layout the
+        // indexing does not match, rather than silently reading the wrong
+        // scales and returning plausible numbers. Every other tensor here is
+        // already checked; this one was not.
+
         EP_HOST_ASSERT(x.element_size() == 1);
         EP_HOST_ASSERT(x_scales->scalar_type() == torch::kFloat32 or x_scales->scalar_type() == torch::kInt);
         EP_HOST_ASSERT(x_scales->dim() == 2);
+        // `scale_token_stride`/`scale_hidden_stride` are computed below and
+        // handed to the kernels, but the kernels index `x_scales` as
+        // `token_idx * num_scales + i` and ignore them (intranode.cu:486,
+        // internode.cu). Until they honour the strides, refuse any layout the
+        // indexing does not match rather than silently reading the wrong
+        // scales and returning plausible numbers. Every other tensor here is
+        // already checked; this one was not.
+        EP_HOST_ASSERT(x_scales->is_contiguous());
         EP_HOST_ASSERT(x_scales->size(0) == num_tokens);
         num_scales = x_scales->dim() == 1 ? 1 : static_cast<int>(x_scales->size(1));
         x_scales_ptr = static_cast<float*>(x_scales->data_ptr());
@@ -1001,11 +1120,32 @@ Buffer::internode_dispatch(const torch::Tensor& x,
         at::cuda::setCurrentCUDAStream(comm_stream);
     }
 
-    // Wait previous tasks to be finished
+    // Wait previous tasks to be finished.
+    //
+    // The wait on `compute_stream` is unconditional, and must be: the output
+    // tensors below are allocated with `compute_stream` current, so the caching
+    // allocator may hand us a block whose previous owner still has work in
+    // flight on that stream. The allocator's safety argument is that a stream
+    // is in-order, but we are about to write those blocks from `comm_stream`,
+    // which is a third stream it knows nothing about. Taking only the
+    // `previous_event` branch leaves that unordered -- and callers pass a
+    // `previous_event` exactly when they are overlapping streams and so are
+    // most exposed (vLLM's dual-batch overlap does).
+    //
+    // `previous_event` is an additional, narrower dependency, not a substitute.
+    //
+    // Scope, precisely: this closes the ALLOC-side hazard only, and only when
+    // the outputs are allocated on the caller's stream. When
+    // `allocate_on_comm_stream` is set they are allocated on `comm_stream`
+    // itself (see the `setCurrentCUDAStream` above), so the wait buys nothing
+    // and `stream_wait` would trip its own `s_0.id() != s_1.id()` assert.
+    // The symmetric FREE-side hazard on the *input* tensors -- allocated by the
+    // caller on a stream this function never waits on or records against -- is
+    // NOT addressed here.
+    if (not allocate_on_comm_stream and comm_stream.id() != compute_stream.id())
+        stream_wait(comm_stream, compute_stream);
     if (previous_event.has_value()) {
         stream_wait(comm_stream, previous_event.value());
-    } else {
-        stream_wait(comm_stream, compute_stream);
     }
 
     // Create handles (only return for non-cached mode)
@@ -1203,8 +1343,14 @@ Buffer::internode_dispatch(const torch::Tensor& x,
 
     // Wait streams
     std::optional<EventHandle> event;
-    if (async) {
-        event = EventHandle(comm_stream);
+    // Tell the caching allocator every tensor here is live on
+    // `comm_stream`, on BOTH paths. The sync path's
+    // `stream_wait(compute_stream, comm_stream)` below orders the
+    // caller's stream after us, but says nothing about the streams
+    // the *input* tensors were allocated on -- under an overlapped
+    // caller (vLLM's dual-batch overlap) that is a third stream,
+    // and the allocator will happily recycle those blocks while we
+    // are still reading them.
         for (auto& t : {x,
                         is_token_in_rank,
                         recv_x,
@@ -1238,6 +1384,8 @@ Buffer::internode_dispatch(const torch::Tensor& x,
             if (allocate_on_comm_stream)
                 to.has_value() ? to->record_stream(compute_stream) : void();
         }
+    if (async) {
+        event = EventHandle(comm_stream);
     } else {
         stream_wait(compute_stream, comm_stream);
     }
@@ -1324,11 +1472,32 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
         at::cuda::setCurrentCUDAStream(comm_stream);
     }
 
-    // Wait previous tasks to be finished
+    // Wait previous tasks to be finished.
+    //
+    // The wait on `compute_stream` is unconditional, and must be: the output
+    // tensors below are allocated with `compute_stream` current, so the caching
+    // allocator may hand us a block whose previous owner still has work in
+    // flight on that stream. The allocator's safety argument is that a stream
+    // is in-order, but we are about to write those blocks from `comm_stream`,
+    // which is a third stream it knows nothing about. Taking only the
+    // `previous_event` branch leaves that unordered -- and callers pass a
+    // `previous_event` exactly when they are overlapping streams and so are
+    // most exposed (vLLM's dual-batch overlap does).
+    //
+    // `previous_event` is an additional, narrower dependency, not a substitute.
+    //
+    // Scope, precisely: this closes the ALLOC-side hazard only, and only when
+    // the outputs are allocated on the caller's stream. When
+    // `allocate_on_comm_stream` is set they are allocated on `comm_stream`
+    // itself (see the `setCurrentCUDAStream` above), so the wait buys nothing
+    // and `stream_wait` would trip its own `s_0.id() != s_1.id()` assert.
+    // The symmetric FREE-side hazard on the *input* tensors -- allocated by the
+    // caller on a stream this function never waits on or records against -- is
+    // NOT addressed here.
+    if (not allocate_on_comm_stream and comm_stream.id() != compute_stream.id())
+        stream_wait(comm_stream, compute_stream);
     if (previous_event.has_value()) {
         stream_wait(comm_stream, previous_event.value());
-    } else {
-        stream_wait(comm_stream, compute_stream);
     }
 
     // Top-k checks
@@ -1421,8 +1590,14 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
 
     // Wait streams
     std::optional<EventHandle> event;
-    if (async) {
-        event = EventHandle(comm_stream);
+    // Tell the caching allocator every tensor here is live on
+    // `comm_stream`, on BOTH paths. The sync path's
+    // `stream_wait(compute_stream, comm_stream)` below orders the
+    // caller's stream after us, but says nothing about the streams
+    // the *input* tensors were allocated on -- under an overlapped
+    // caller (vLLM's dual-batch overlap) that is a third stream,
+    // and the allocator will happily recycle those blocks while we
+    // are still reading them.
         for (auto& t : {x,
                         src_meta,
                         is_combined_token_in_rank,
@@ -1441,6 +1616,8 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
             if (allocate_on_comm_stream)
                 to.has_value() ? to->record_stream(compute_stream) : void();
         }
+    if (async) {
+        event = EventHandle(comm_stream);
     } else {
         stream_wait(compute_stream, comm_stream);
     }

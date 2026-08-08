@@ -379,11 +379,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* recv_to
             asm volatile("bar.sync %0, %1;" :: "r"(responsible_rank), "r"(num_threads_per_rank));
 #endif
             if (send_warp_id_in_rank == 0 and send_lane_id == 0)
-#if defined(USE_ROCM)
-                st_relaxed_sys_global(channel_tail_idx.buffer(), cached_channel_tail_idx);
-#else
                 st_release_sys_global(channel_tail_idx.buffer(), cached_channel_tail_idx);
-#endif
         }
     } else {
         // Workers for receiving and copying into buffer
@@ -422,11 +418,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* recv_to
         while (num_tokens_to_recv > 0) {
             // NOTES: unlike the sender, the receiver must ensure that the tail indices hold by different warps are same
             while (recv_thread_id_in_rank == 0) {
-#if defined(USE_ROCM)
-                cached_channel_tail_idx = ld_relaxed_sys_global(channel_tail_idx.buffer());
-#else
                 cached_channel_tail_idx = ld_acquire_sys_global(channel_tail_idx.buffer());
-#endif
 
                 // Ready to copy
                 if (cached_channel_head_idx != cached_channel_tail_idx) {
@@ -765,11 +757,7 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
             asm volatile("bar.sync %0, %1;" :: "r"(send_rank_id), "r"(num_threads_per_rank));
 #endif
             if (lane_id == 0 and send_warp_id_in_rank == 0)
-#if defined(USE_ROCM)
-                st_relaxed_sys_global(channel_tail_idx.buffer(), current_channel_tail_idx);
-#else
                 st_release_sys_global(channel_tail_idx.buffer(), current_channel_tail_idx);
-#endif
         }
     } else {
         // Workers for receiving
@@ -810,11 +798,12 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
                     break;
 
                 // Update queue tail
-#if defined(USE_ROCM)
+                // Relaxed: this warp only needs the *value*. Its acquire never
+                // reached the threads that matter -- the payload is read by the
+                // receiver warps below, and the only thing between them and this
+                // warp is a plain `volatile __shared__` write, which is not a
+                // synchronizes-with edge. The acquire belongs there, not here.
                 channel_tail_idx[lane_id] = ld_relaxed_sys_global(channel_tail_idx_ptr);
-#else
-                channel_tail_idx[lane_id] = ld_acquire_sys_global(channel_tail_idx_ptr);
-#endif
 
                 // Update minimum head
                 int min_head = std::numeric_limits<int>::max();
@@ -870,6 +859,10 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
                         trap();
                     }
                 }
+                // Pairs with the peer's `st_release_sys_global` on the tail, via
+                // the relaxed load in the head-updater warp ([atomics.fences]/3).
+                // This is the thread that goes on to read the payload.
+                acquire_fence_sys();
                 syncwarp();
 
                 // Broadcast current heads
