@@ -297,7 +297,8 @@ dispatch(int4* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* recv_to
                     break;
 
                 // Rare cases to loop again
-                long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
+                auto now = wall_clock64();  // once: s_memrealtime is long-latency
+                    long long int elapsed_time = now > start_time ? now - start_time : 0;
                 if (elapsed_time > NUM_TIMEOUT_CYCLES) {
                     printf("DeepEP timeout for dispatch senders, rank %d, responsible_channel = %d\n", rank, responsible_channel);
                     trap();
@@ -418,16 +419,29 @@ dispatch(int4* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* recv_to
         while (num_tokens_to_recv > 0) {
             // NOTES: unlike the sender, the receiver must ensure that the tail indices hold by different warps are same
             while (recv_thread_id_in_rank == 0) {
-                cached_channel_tail_idx = ld_acquire_sys_global(channel_tail_idx.buffer());
+                // Relaxed in the loop, one acquire fence after it. An acquire
+                // load emits `buffer_inv sc0 sc1` -- an L1+L2 invalidate -- on
+                // EVERY iteration of a max-rate poll. Without DBO that is
+                // cheap because this kernel runs alone; with DBO the peer
+                // ubatch's GEMMs are co-resident by design, so the spin
+                // continuously flushes exactly the working set the overlap
+                // exists to build. [atomics.fences]/3 gives the same
+                // happens-before from one fence on exit.
+                cached_channel_tail_idx = ld_relaxed_sys_global(channel_tail_idx.buffer());
 
                 // Ready to copy
                 if (cached_channel_head_idx != cached_channel_tail_idx) {
+                    acquire_fence_sys();
                     shared_channel_tail_idx[responsible_rank] = cached_channel_tail_idx;
                     break;
                 }
+#ifdef USE_ROCM
+                __builtin_amdgcn_s_sleep(1);
+#endif
 
                 // Timeout check
-                long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
+                auto now = wall_clock64();  // once: s_memrealtime is long-latency
+                    long long int elapsed_time = now > start_time ? now - start_time : 0;
                 if (elapsed_time > NUM_TIMEOUT_CYCLES) {
                     printf("DeepEP timeout for dispatch receivers, rank %d, responsible_channel = %d, tokens remained: %d\n", rank, responsible_channel, num_tokens_to_recv);
                     trap();
@@ -713,7 +727,8 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
                     break;
 
                 // Rare cases to loop again
-                long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
+                auto now = wall_clock64();  // once: s_memrealtime is long-latency
+                    long long int elapsed_time = now > start_time ? now - start_time : 0;
                 if (elapsed_time > NUM_TIMEOUT_CYCLES) {
                     printf("DeepEP timeout for combine senders, rank %d, responsible_channel = %d\n", rank, responsible_channel);
                     trap();
@@ -842,6 +857,9 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
             int token_start_idx, token_end_idx;
             get_channel_task_range(num_recv_tokens, num_channels, responsible_channel, token_start_idx, token_end_idx);
 
+            // Highest tail this lane has already acquired against.
+            int last_fenced_tail = -1;
+
             // Iterate over all tokens and combine
             for (int64_t token_idx = token_start_idx + recv_warp_id - 1; token_idx < token_end_idx; token_idx += num_recv_warps - 1) {
                 // Read expected head
@@ -853,7 +871,8 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
                 while (__any_sync(kFullWarpMask, channel_tail_idx[lane_id] <= expected_head and expected_head >= 0)) {
                 // while (channel_tail_idx[lane_id] <= expected_head and expected_head >= 0) {
                     // Timeout check
-                    long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
+                    auto now = wall_clock64();  // once: s_memrealtime is long-latency
+                    long long int elapsed_time = now > start_time ? now - start_time : 0;
                     if (elapsed_time > NUM_TIMEOUT_CYCLES) {
                         printf("DeepEP timeout for combine receivers, rank %d, responsible_channel = %d, expect = %d\n", rank, responsible_channel, expected_head);
                         trap();
@@ -862,7 +881,19 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
                 // Pairs with the peer's `st_release_sys_global` on the tail, via
                 // the relaxed load in the head-updater warp ([atomics.fences]/3).
                 // This is the thread that goes on to read the payload.
-                acquire_fence_sys();
+                //
+                // Fence only when the tail we depend on has ADVANCED. One
+                // release publishes a whole chunk of tokens, so one acquire
+                // covers every token up to that tail; fencing per token pays a
+                // full `buffer_inv sc0 sc1` for each one, and the spin above
+                // normally exits on the first check, so most of those would
+                // guard a wait that never happened. `__any_sync` keeps the
+                // decision warp-uniform.
+                int cur_tail = (lane_id < kNumRanks) ? channel_tail_idx[lane_id] : -1;
+                if (__any_sync(kFullWarpMask, cur_tail > last_fenced_tail)) {
+                    acquire_fence_sys();
+                    last_fenced_tail = cur_tail;
+                }
                 syncwarp();
 
                 // Broadcast current heads
